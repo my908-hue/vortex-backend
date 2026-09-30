@@ -181,7 +181,34 @@ export interface AppConfig {
      */
     pollMs: number;
   };
+lane is never open.
+     */
+    operatorToken: string;
+    /**
+     * Redis URL used for cross-replica pause propagation. Empty falls back to
+     * database polling only, which still meets the propagation budget.
+     */
+    redisUrl: string;
+    /**
+     * Interval (ms) for the `max_updated_at` probe that backstops Redis pub/sub.
+     * Worst-case propagation delay is roughly this value, so it must stay
+     * comfortably under the 5 s propagation requirement.
+     */
+    pollMs: number;
+  };
 
+  /**
+   * Shadow-mode divergence monitor (issue #401).
+   *
+   * Runs read-only on-chain simulations of every intent state transition in
+   * parallel with the authoritative off-chain path and reports where the two
+   * disagree. See docs/runbooks/onchain-cutover.md for the go/no-go threshold.
+   */
+  shadow: {
+    /** Master switch. When false, `ShadowService.observe` is a no-op. */
+    enabled: boolean;
+    /** Fraction of transitions to simulate, in `[0, 1]`. `1` = every one. */
+    sampleR
   /**
    * Shadow-mode divergence monitor (issue #401).
    *
@@ -223,6 +250,48 @@ export interface AppConfig {
     paramsPollIntervalMs: number;
   };
 
+  governance: {
+    /**
+     * On-chain governance / parameters contract ID.
+     * When set, ProtocolParamsService reads current + scheduled parameters
+     * from this contract and exposes them via GET /api/v1/params.
+     * Leave blank to use code / env defaults only.
+     */
+    paramsContractId: string;
+    /**
+     * How often (in milliseconds) to poll the parameters contract for changes.
+     * Default: 30 000 ms (30 s).
+     */
+    paramsPollIntervalMs: number;
+  };
+  governance: {
+    /**
+     * On-chain governance / parameters contract ID.
+     * When set, ProtocolParamsService reads current + scheduled parameters
+     * from this contract and exposes them via GET /api/v1/params.
+     * Leave blank to use code / env defaults only.
+     */
+    paramsContractId: string;
+    /**
+     * How often (in milliseconds) to poll the parameters contract for changes.
+     * Default: 30 000 ms (30 s).
+     */
+    paramsPollIntervalMs: number;
+  };
+  leaderElection: {
+    /** When false, all workers run unconditionally (pre-election behaviour). */
+    enabled: boolean;
+    /** Heartbeat interval in ms (default 5000). */
+    heartbeatMs: number;
+  };
+  /**
+   * Process role (issue #494). Producers may enqueue jobs from any role;
+   * queue workers only run when the role is "worker" or "all".
+   */
+  processRole: "api" | "worker" | "all";
+  jobs: {
+    /** "memory" (single-process, dev/test) or "bullmq" (Redis-backed, durable). */
+    drive
   leaderElection: {
     /** When false, all workers run unconditionally (pre-election behaviour). */
     enabled: boolean;

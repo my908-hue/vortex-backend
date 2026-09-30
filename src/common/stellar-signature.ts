@@ -12,6 +12,8 @@
 import { Keypair } from "@stellar/stellar-sdk";
 import { UnauthorizedException } from "@nestjs/common";
 import { createHash } from "node:crypto";
+import { Keypair } from "@stellar/stellar-sdk";
+import { UnauthorizedException } from "@nestjs/common";
 
 export const INTENT_SIGNATURE_CLOCK_SKEW_SECONDS = 30;
 export const MAX_INTENT_SIGNATURE_TTL_SECONDS = 900;
@@ -53,6 +55,33 @@ export function verifyStellarSignature(
   try {
     const keypair = Keypair.fromPublicKey(publicKey);
     const messageBytes = Buffer.from(message, "utf8");
+    const signatureBytes = Buffer.from(signature, "base64");
+    if (!keypair.verify(messageBytes, signatureBytes)) {
+      throw new UnauthorizedException("Invalid Stellar signature");
+    }
+  } catch (error) {
+    if (error instanceof UnauthorizedException) {
+      throw error;
+    }
+    throw new UnauthorizedException("Invalid Stellar signature");
+  }
+}
+
+/**
+ * Verify that `signature` (base64) over `message` (utf-8) was produced by
+ * the private key corresponding to `publicKey` (Stellar G-address).
+ *
+ * Throws UnauthorizedException on any failure so callers can let it propagate
+ * straight to the HTTP layer.
+ */
+export function verifyStellarSignature(
+  publicKey: string,
+  message: string,
+  signature: string,
+): void {
+  try {
+    const keypair = Keypair.fromPublicKey(publicKey);
+    const messageBytes = Buffer.from(message, "utf8");
     const sigBytes = Buffer.from(signature, "base64");
     const valid = keypair.verify(messageBytes, sigBytes);
     if (!valid) {
@@ -70,6 +99,9 @@ export function verifyStellarSignature(
  */
 export function buildCancelMessage(intentId: string, context?: IntentSignatureContext, user?: string): string {
   if (context) return buildV2IntentMessage(context, "cancel", intentId, { user: user ?? "" });
+
+  return `cancel:${intentId}`;
+}
   return `cancel:${intentId}`;
 }
 
@@ -85,6 +117,9 @@ export function buildWsAuthMessage(solver: string, timestamp: number | string): 
  */
 export function buildAcceptMessage(intentId: string, solver: string, context?: IntentSignatureContext): string {
   if (context) return buildV2IntentMessage(context, "accept", intentId, { solver });
+
+  return `accept:${intentId}:${solver}`;
+}
   return `accept:${intentId}:${solver}`;
 }
 
@@ -104,6 +139,8 @@ export function buildFillMessage(
       txHash: fill?.txHash ?? null,
     });
   }
+  return `fill:${intentId}:${solver}`;
+}
   return `fill:${intentId}:${solver}`;
 }
 
@@ -166,3 +203,4 @@ export function buildDisputeDecisionMessage(disputeId: string, resolution: strin
 export function buildUpdateSolverMessage(address: string): string {
   return `update-solver:${address}`;
 }
+
