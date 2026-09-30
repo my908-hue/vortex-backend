@@ -99,7 +99,6 @@ export interface AppConfig {
   nodeEnv: string;
   port: number;
   databaseUrl: string;
-  datasets: import("../datasets/datasets.types").DatasetsConfig;
   stellar: {
     network: "testnet" | "futurenet" | "mainnet";
     sorobanRpcUrl: string;
@@ -129,6 +128,7 @@ export interface AppConfig {
   };
   intentRetentionDays: number;
   intentRetentionSweepMs: number;
+  quoteAuctionWindowMs: number;
   /**
    * Dry-run flag for on-chain write paths (issue #260).
    *
@@ -272,6 +272,7 @@ export interface AppConfig {
     refreshIntervalMs: number;
     /** Comma-separated extra secrets: "name:envVar:required". */
     extra: string;
+  };
   /** WS gateway hardening (issue #455). */
   ws: {
     /** Largest inbound frame accepted; larger frames close the socket (1009). */
@@ -370,6 +371,7 @@ export default (): AppConfig => ({
   },
   intentRetentionDays: parseInt(process.env.INTENT_RETENTION_DAYS ?? "30", 10),
   intentRetentionSweepMs: parseInt(process.env.INTENT_RETENTION_SWEEP_MS ?? "60000", 10),
+  quoteAuctionWindowMs: parseInt(process.env.QUOTE_AUCTION_WINDOW_MS ?? "300", 10),
   // Default to dry-run (true) outside production; in production the value must
   // be explicitly set (validated by envValidationSchema).
   onchainDryRun: process.env.ONCHAIN_DRY_RUN !== undefined
@@ -429,16 +431,6 @@ export default (): AppConfig => ({
     overrides: process.env.FLAG_OVERRIDES ?? "",
   },
   adminApiKeys: process.env.ADMIN_API_KEYS ?? "",
-  datasets: {
-    enabled: (process.env.DATASETS_ENABLED ?? "false") === "true",
-    anonymize: (process.env.DATASETS_ANONYMIZE ?? "true") === "true",
-    salt: process.env.DATASETS_SALT ?? "",
-    saltRotationHours: parseInt(process.env.DATASETS_SALT_ROTATION_HOURS ?? "24", 10),
-    saltRetentionWindows: parseInt(process.env.DATASETS_SALT_RETENTION_WINDOWS ?? "2", 10),
-    publicBucket: process.env.DATASETS_PUBLIC_BUCKET ?? "",
-    storageKind: (process.env.DATASETS_STORAGE_KIND ?? "memory") as "local" | "memory",
-    localDir: process.env.DATASETS_LOCAL_DIR ?? "",
-  },
   guardianContractId: process.env.GUARDIAN_CONTRACT_ID ?? "",
   canaryAddresses: (process.env.CANARY_ADDRESSES ?? "")
     .split(",")
@@ -458,6 +450,7 @@ export default (): AppConfig => ({
     provider: (process.env.SECRETS_PROVIDER ?? "env") as "env" | "aws-secrets-manager" | "vault-kv",
     refreshIntervalMs: parseInt(process.env.SECRETS_REFRESH_INTERVAL_MS ?? "60000", 10),
     extra: process.env.SECRETS_EXTRA ?? "",
+  },
   ws: {
     maxPayloadBytes: parseInt(process.env.WS_MAX_PAYLOAD_BYTES ?? "16384", 10),
     maxConnectionsPerIp: parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP ?? "20", 10),

@@ -32,7 +32,7 @@ import {
 import { Throttle } from "@nestjs/throttler";
 import { IntentsService } from "./intents.service";
 import { IntentsGateway } from "./intents.gateway";
-import { SolversService } from "../solvers/solvers.service";
+import { SolversService, solverSupports } from "../solvers/solvers.service";
 import { TokensService } from "../tokens/tokens.service";
 import { RoutingService } from "../routing/routing.service";
 import { MAX_OPEN_INTENTS_PER_USER } from "./intents.service";
@@ -60,6 +60,7 @@ import {
 } from "../common/stellar-signature";
 import { SignatureNonceService } from "../common/signature-nonce.service";
 import { EvmSignatureVerifier } from "../common/evm-signature";
+import { SolverRecord } from "../solvers/solvers.types";
 import {
   applyVarianceScale,
   calculateProtocolFee,
@@ -90,6 +91,16 @@ interface IntentSignatureProof {
   expiresAt?: number;
 }
 
+interface QuoteCandidate {
+  solver: SolverRecord;
+  dstAmount: bigint;
+  fee: bigint;
+  netDstAmount: bigint;
+  fillTime: number;
+  expiresAt: number;
+  reputationScore: number;
+}
+
 @ApiTags("intents")
 @Controller("api/v1/intents")
 export class IntentsController {
@@ -111,6 +122,7 @@ export class IntentsController {
     this.signatureNetwork = config.get("stellar.network", { infer: true });
     this.legacyStellarSignatures = config.get("legacyStellarSignatures", { infer: true });
     this.nodeEnv = config.get("nodeEnv", { infer: true });
+    this.quoteAuctionWindowMs = config.get("quoteAuctionWindowMs", { infer: true });
   }
 
   /** Canary addresses (issue #496). */
@@ -118,6 +130,7 @@ export class IntentsController {
   private readonly signatureNetwork: AppConfig["stellar"]["network"];
   private readonly legacyStellarSignatures: boolean;
   private readonly nodeEnv: string;
+  private readonly quoteAuctionWindowMs: number;
 
   private verifyIntentSignature(
     action: IntentSignatureProof["action"],
@@ -853,7 +866,12 @@ export class IntentsController {
   })
   @ApiOkResponse({ type: QuoteResponseDto })
   async quote(@Body() dto: QuoteRequestDto): Promise<QuoteResponseDto> {
-    const solvers = (await this.solversService.getAll()).filter((s) => s.isActive);
+    const solvers = (await this.solversService.getAll()).filter(
+      (solver) =>
+        solver.isActive &&
+        BigInt(solver.bondAmount) > 0n &&
+        solverSupports(solver, dto.srcChain, dto.srcTokenSymbol),
+    );
 
     // #219: use typed resolveSrcToken / resolveDstToken — no more any casts.
     // #276: a quote may be requested by symbol alone (no contract/address), but
@@ -875,8 +893,24 @@ export class IntentsController {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const srcPriceUSD: number = (srcToken as any)?.priceUSD ?? dstPriceUSD;
 
-    const quotes = solvers
-      .map((solver) => {
+    const rfqResponses = await this.intentsGateway.requestRfq(
+      {
+        srcChain: dto.srcChain,
+        srcTokenSymbol: dto.srcTokenSymbol,
+        srcAmount: dto.srcAmount,
+        dstTokenSymbol: dto.dstTokenSymbol,
+        srcTokenAddress: dto.srcTokenAddress,
+        dstTokenContract: dto.dstTokenContract,
+      },
+      solvers.map((solver) => solver.address),
+      this.quoteAuctionWindowMs,
+    );
+    const indicative = rfqResponses.length === 0;
+    const now = Math.floor(Date.now() / 1000);
+    const quoteCandidates: QuoteCandidate[] = [];
+
+    if (indicative) {
+      for (const solver of solvers) {
         // Issue #118: weight variance by solver performance history.
         const totalFills = solver.fillsCompleted + solver.fillsFailed;
         const successRate = totalFills > 0 ? solver.fillsCompleted / totalFills : 0.5;
@@ -885,59 +919,95 @@ export class IntentsController {
         const varianceScaled = varianceScaleFromPerfScore(perfScore);
         const dstAmount = applyVarianceScale(srcAmountBigInt, varianceScaled);
         const fee = calculateProtocolFee(dstAmount); // 0.05%
-
-        // Issue #126: compute USD fee total and price impact.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const feeUnits = toDecimalNumber(fee, (dstToken as any)?.decimals ?? 7);
-        const totalFeesUSD = feeUnits * dstPriceUSD;
-        const srcUnits = toDecimalNumber(srcAmountBigInt, srcToken?.decimals ?? 7);
-        const dstUnits = toDecimalNumber(dstAmount, dstToken?.decimals ?? 7);
-        const priceImpact =
-          srcPriceUSD > 0 && dstPriceUSD > 0
-            ? Math.max(0, 1 - (dstUnits * dstPriceUSD) / (srcUnits * srcPriceUSD))
-            : 0;
-
-        // #220: attach a computed route to each solver quote.
-        // Build minimal TokenInfo objects for routing (uses resolved data when available).
-        const srcTokenInfo = {
-          address: dto.srcTokenAddress ?? "",
-          symbol: dto.srcTokenSymbol,
-          name: srcToken?.name ?? dto.srcTokenSymbol,
-          decimals: srcToken?.decimals ?? 18,
-          chain: (dto.srcChain as SupportedChain) ?? "ethereum",
-          priceUSD: srcToken?.priceUSD,
-        };
-        const dstTokenInfo = {
-          address: dstToken?.contract ?? dto.dstTokenContract ?? "",
-          symbol: dto.dstTokenSymbol,
-          name: dstToken?.name ?? dto.dstTokenSymbol,
-          decimals: dstToken?.decimals ?? 7,
-          chain: "stellar" as SupportedChain,
-          priceUSD: dstToken?.priceUSD,
-        };
-
-        // Try a direct route; fall back to a two-hop via USDC intermediate when
-        // a direct solver path is not viable (different base tokens).
-        const route = this.routingService.buildRoute(srcTokenInfo, dstTokenInfo, solver.address, {
-          totalFeesUSD,
-          priceImpact,
-          estimatedFillTime: solver.avgFillTime + Math.floor(Math.random() * 30),
-        });
-
-        return {
-          solver: solver.address,
-          solverName: solver.name,
-          dstAmount: dstAmount.toString(),
-          fee: fee.toString(),
+        const ageDays = Math.max(0, (now - solver.registeredAt) / 86_400);
+        const reputationScore = successRate * Math.exp(-ageDays / 180);
+        quoteCandidates.push({
+          solver,
+          dstAmount,
+          fee,
+          netDstAmount: dstAmount > fee ? dstAmount - fee : 0n,
           fillTime: solver.avgFillTime + Math.floor(Math.random() * 30),
-          expiresAt: Math.floor(Date.now() / 1000) + 60,
-          totalFeesUSD,
-          priceImpact,
-          route,
-        };
-      })
-      // nosemgrep: no-number-money -- sort comparator on bounded quote diffs only; amounts stay strings elsewhere.
-      .sort((a, b) => Number(BigInt(b.dstAmount) - BigInt(a.dstAmount)));
+          expiresAt: now + 60,
+          reputationScore,
+        });
+      }
+    } else {
+      const solversByAddress = new Map(solvers.map((solver) => [solver.address, solver]));
+      for (const response of rfqResponses) {
+        const solver = solversByAddress.get(response.solver);
+        if (!solver) continue;
+        const dstAmount = BigInt(response.dstAmount);
+        const fee = BigInt(response.fee) + calculateProtocolFee(dstAmount);
+        if (fee >= dstAmount) continue;
+        const totalFills = solver.fillsCompleted + solver.fillsFailed;
+        const successRate = totalFills > 0 ? solver.fillsCompleted / totalFills : 0;
+        const ageDays = Math.max(0, (now - solver.registeredAt) / 86_400);
+        quoteCandidates.push({
+          solver,
+          dstAmount,
+          fee,
+          netDstAmount: dstAmount - fee,
+          fillTime: solver.avgFillTime,
+          expiresAt: response.expiresAt,
+          reputationScore: successRate * Math.exp(-ageDays / 180),
+        });
+      }
+    }
+
+    quoteCandidates.sort((left, right) => {
+      if (left.netDstAmount !== right.netDstAmount) {
+        return left.netDstAmount > right.netDstAmount ? -1 : 1;
+      }
+      return right.reputationScore - left.reputationScore || right.solver.fillsCompleted - left.solver.fillsCompleted;
+    });
+
+    const quotes = quoteCandidates.map((candidate) => {
+      // Issue #126: compute USD fee total and price impact.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const feeUnits = toDecimalNumber(candidate.fee, (dstToken as any)?.decimals ?? 7);
+      const totalFeesUSD = feeUnits * dstPriceUSD;
+      const srcUnits = toDecimalNumber(srcAmountBigInt, srcToken?.decimals ?? 7);
+      const netDstUnits = toDecimalNumber(candidate.netDstAmount, dstToken?.decimals ?? 7);
+      const priceImpact =
+        srcPriceUSD > 0 && dstPriceUSD > 0
+          ? Math.max(0, 1 - (netDstUnits * dstPriceUSD) / (srcUnits * srcPriceUSD))
+          : 0;
+
+      const srcTokenInfo = {
+        address: dto.srcTokenAddress ?? "",
+        symbol: dto.srcTokenSymbol,
+        name: srcToken?.name ?? dto.srcTokenSymbol,
+        decimals: srcToken?.decimals ?? 18,
+        chain: dto.srcChain,
+        priceUSD: srcToken?.priceUSD,
+      };
+      const dstTokenInfo = {
+        address: dstToken?.contract ?? dto.dstTokenContract ?? "",
+        symbol: dto.dstTokenSymbol,
+        name: dstToken?.name ?? dto.dstTokenSymbol,
+        decimals: dstToken?.decimals ?? 7,
+        chain: "stellar" as SupportedChain,
+        priceUSD: dstToken?.priceUSD,
+      };
+      const route = this.routingService.buildRoute(
+        srcTokenInfo,
+        dstTokenInfo,
+        candidate.solver.address,
+        { totalFeesUSD, priceImpact, estimatedFillTime: candidate.fillTime },
+      );
+
+      return {
+        solver: candidate.solver.address,
+        solverName: candidate.solver.name,
+        dstAmount: candidate.dstAmount.toString(),
+        fee: candidate.fee.toString(),
+        fillTime: candidate.fillTime,
+        expiresAt: candidate.expiresAt,
+        totalFeesUSD,
+        priceImpact,
+        route,
+      };
+    });
 
     if (dto.intentId && quotes.length > 0) {
       await this.intentsService.update(dto.intentId, { quotedDstAmount: quotes[0].dstAmount });
@@ -954,6 +1024,7 @@ export class IntentsController {
       estimatedFillTime: best?.fillTime ?? 0,
       totalFeesUSD: best?.totalFeesUSD ?? 0,
       priceImpact: best?.priceImpact ?? 0,
+      indicative,
     };
   }
 

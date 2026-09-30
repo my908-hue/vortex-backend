@@ -81,6 +81,7 @@ function makeConfigService(
       provider: "env",
       refreshIntervalMs: 60000,
       extra: "",
+    },
     ws: {
       maxPayloadBytes: 16384,
       maxConnectionsPerIp: 20,
@@ -91,6 +92,7 @@ function makeConfigService(
       outboundQueueMax: 1000,
       outboundBufferBytes: 1048576,
       slowConsumerPolicy: "drop_oldest",
+      drainTimeoutMs: 25000,
     },
     authJwtSecret: "",
     rateLimitLocalPruneMs: 60000,
@@ -99,26 +101,6 @@ function makeConfigService(
     sse: {
       heartbeatMs: 15000,
       maxBufferBytes: 1048576,
-    },
-    datasets: {
-      enabled: false,
-      anonymize: true,
-      salt: "",
-      saltRotationHours: 24,
-      saltRetentionWindows: 2,
-      publicBucket: "",
-      storageKind: "memory",
-      localDir: "",
-    },
-    treasury: {
-      address: "",
-    },
-    shadow: {
-      enabled: false,
-      sampleRate: 1,
-      queueMax: 256,
-      concurrency: 4,
-      sourceAccount: "",
     },
     health: {
       roles: ["api", "ws", "worker"],

@@ -1,17 +1,26 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { SorobanRpc, Transaction } from "@stellar/stellar-sdk";
+import { EgressPurpose, HttpEgressService } from "../common/http-egress";
 import { AppConfig } from "../config/configuration";
 
 @Injectable()
 export class SorobanService {
   private readonly server: SorobanRpc.Server;
   private readonly rpcUrl: string;
+  private readonly egress: HttpEgressService;
 
   constructor(configService: ConfigService<AppConfig, true>) {
     const rpcUrl = configService.get("stellar.sorobanRpcUrl", { infer: true });
     this.rpcUrl = rpcUrl;
     this.server = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
+    this.egress = new HttpEgressService({
+      timeoutMs: 10_000,
+      maxRedirects: 0,
+      maxBodySizeBytes: 1_048_576,
+      allowlist: [new URL(rpcUrl).hostname],
+      blockPrivateRanges: false,
+    });
   }
 
   getHealth() {
@@ -42,7 +51,7 @@ export class SorobanService {
    * the `{ header: { closeTime } }` shape the ingestion loop reads.
    */
   async getLedger(sequence: number): Promise<{ header?: { closeTime?: string } }> {
-    const response = await fetch(this.rpcUrl, {
+    const response = await this.egress.fetch(this.rpcUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -51,11 +60,12 @@ export class SorobanService {
         method: "getLedgers",
         params: { startLedger: sequence, endLedger: sequence },
       }),
+      purpose: EgressPurpose.RPC,
     });
-    if (!response.ok) {
-      throw new Error(`getLedgers HTTP ${response.status} for ledger ${sequence}`);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`getLedgers HTTP ${response.statusCode} for ledger ${sequence}`);
     }
-    const body = (await response.json()) as {
+    const body = JSON.parse(response.body) as {
       result?: { ledgers?: Array<{ ledgerCloseTime?: string }> };
       error?: { message?: string };
     };
@@ -64,13 +74,6 @@ export class SorobanService {
     }
     const ledger = body.result?.ledgers?.[0];
     return ledger ? { header: { closeTime: ledger.ledgerCloseTime } } : {};
-  getLedger(sequence: number) {
-    // The stellar-sdk 12.x Server type no longer exposes `getLedger`; the call
-    // is preserved for the event-ingestion lag metric. Cast to keep compiling
-    // against the pinned SDK — the runtime API may need a follow-up migration.
-    return (this.server as unknown as {
-      getLedger(seq: number): Promise<{ header?: { closeTime?: string | number } }>;
-    }).getLedger(sequence);
   }
 
   getEvents(request: SorobanRpc.Server.GetEventsRequest) {

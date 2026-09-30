@@ -50,9 +50,6 @@ export const envValidationSchema = Joi.object({
     }),
 
   ONCHAIN_INTENTS_ENABLED: Joi.boolean().default(false),
-  // Stellar public key of the treasury account (fee/slash/refund accumulator).
-  TREASURY_ADDRESS: Joi.string().allow("").default(""),
-
   // Stellar public key of the treasury account (fee accumulator).
   TREASURY_ADDRESS: Joi.string().allow("").default(""),
 
@@ -107,6 +104,7 @@ export const envValidationSchema = Joi.object({
   // the eviction sweep runs.  Both are read by IntentsService.
   INTENT_RETENTION_DAYS: Joi.number().integer().min(0).default(30),
   INTENT_RETENTION_SWEEP_MS: Joi.number().integer().min(0).default(60000),
+  QUOTE_AUCTION_WINDOW_MS: Joi.number().integer().min(1).max(1000).default(300),
 
   // ── Reference solver bot (scripts/solver-bot.ts) ───────────────────────────
   // Read by the standalone bot process rather than by the server, but declared
@@ -353,15 +351,8 @@ export const envValidationSchema = Joi.object({
     .pattern(/^([A-Za-z0-9_.-]+:(admin|superadmin):[^,:]{16,})(,[A-Za-z0-9_.-]+:(admin|superadmin):[^,:]{16,})*$/)
     .default(""),
 
-  // ── Public anonymised datasets ────────────────────────────────────────────
-  DATASETS_ENABLED: Joi.boolean().default(false),
-  DATASETS_ANONYMIZE: Joi.boolean().default(true),
-  DATASETS_SALT: Joi.string().allow("").default(""),
-  DATASETS_SALT_ROTATION_HOURS: Joi.number().integer().min(1).max(720).default(24),
-  DATASETS_SALT_RETENTION_WINDOWS: Joi.number().integer().min(0).max(30).default(2),
-  DATASETS_PUBLIC_BUCKET: Joi.string().allow("").default(""),
+  // Legacy storage selector retained for existing deployments.
   DATASETS_STORAGE_KIND: Joi.string().valid("local", "memory").default("memory"),
-  DATASETS_LOCAL_DIR: Joi.string().allow("").default(""),
 
   // ── Guardian emergency ingestion (issue #507) ─────────────────────────────
   GUARDIAN_CONTRACT_ID: Joi.string().allow("").default(""),

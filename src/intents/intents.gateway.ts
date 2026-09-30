@@ -24,6 +24,7 @@ import { ConnectionState, resolveClientIp } from "./ws/connection-state";
 import { IntentFeedService } from "./feed/intent-feed.service";
 import { FeedClient, FeedFilter } from "./feed/feed.types";
 import { randomUUID } from "node:crypto";
+import { RfqQuoteRequest, VerifiedRfqQuote } from "./rfq.types";
 
 export type { SequencedEvent } from "./backplane/backplane.types";
 export { EventRingBuffer } from "./event-ring-buffer";
@@ -91,114 +92,12 @@ export class IntentsGateway
     return this.feed.backplaneHealth();
   }
 
-  /**
-   * Broadcast an event to every connected client (WS and SSE) on every replica.
-   *
-   * Activity 1: Uses encoding cache — serializes once per format, not per client.
-   * 
-   * Delivery rules (evaluated in order):
-   * 1. Client is not OPEN → skip.
-   * 2. Client set wantAll=true → always deliver.
-   * 3. Client has a solver capability predicate:
-   *    a. Event carries an inlined intent → apply predicate to that intent.
-   *    b. Event is a state-transition (only intentId available) → deliver
-   *       (we cannot efficiently look up the intent here; the solver would
-   *       already have received the intent_created event through the filter).
-   * 4. Client has a plain chain filter (`chains != null`) → apply chain match.
-   * 5. No filter → full unfiltered feed (backward-compatible default).
-   */
-  private deliverToMatchingSubscribers(
-    seq: number,
-    chain: SupportedChain | null,
-    event: { type: string; [key: string]: unknown },
-  ) {
-    for (const [client, filter] of this.subscribers) {
-      if (client.readyState !== WebSocket.OPEN) continue;
-
-      // Opt-out: solver requested full feed.
-      if (filter.wantAll) {
-        this.sendEncoded(client, seq, event);
-        continue;
-      }
-
-      // Authenticated solver — apply capability predicate.
-      if (filter.solver !== null) {
-        const solverPredicate = filter.solver;
-        const inlinedIntent = (event as { intent?: unknown }).intent;
-
-        // intent_created carries a full intent object we can test directly.
-        if (event.type === "intent_created" && inlinedIntent && typeof inlinedIntent === "object") {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const matches = solverPredicate.matches(inlinedIntent as any);
-          if (matches) {
-            this.sendEncoded(client, seq, event);
-            try { this.metricsService?.incWsDelivered(solverPredicate.solverAddress); } catch { /* noop */ }
-          } else {
-            try { this.metricsService?.incWsFiltered(solverPredicate.solverAddress); } catch { /* noop */ }
-          }
-          continue;
-        }
-
-        // State-transition events: the solver already filtered on intent_created,
-        // so we pass them through to keep the feed self-consistent.
-        this.sendEncoded(client, seq, event);
-        try { this.metricsService?.incWsDelivered(solverPredicate.solverAddress); } catch { /* noop */ }
-        continue;
-      }
-
-      // No filter set → full unfiltered feed (backward-compatible default).
-      if (filter.chains === null) {
-        this.sendEncoded(client, seq, event);
-        continue;
-      }
-
-      // Chain couldn't be resolved → deliver to everyone (safe default).
-      if (chain === null) {
-        this.sendEncoded(client, seq, event);
-        continue;
-      }
-
-      // Only send if the event's chain is in this subscriber's filter.
-      if (filter.chains.has(chain)) {
-        this.sendEncoded(client, seq, event);
-      }
-    }
-  }
-
-  handleConnection(client: WebSocket) {
-    this.subscribers.set(client, {
-      chains: null,
-      solver: null,
-      wantAll: false,
-      subscriptionCount: 0,
-    });
-  /**
-   * Send an event to a client using its negotiated encoding format (Activity 1).
-   * 
-   * Retrieves pre-serialized payload from encoding cache, avoiding redundant
-   * serialization work. At 10k connections with msgpack, this saves 9,999
-   * msgpackEncode() calls per broadcast.
-   */
-  private sendEncoded(client: WebSocket, seq: number, event: Record<string, unknown>): void {
-    const state = this.connections.get(client);
-    if (!state) {
-      // Fallback for connections without state (shouldn't happen)
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ seq, ...event }));
-      }
-      return;
-    }
-
-    const payload = this.encodingCache.get(seq, event, state.encoding);
-    const result = state.send(payload);
-    
-    if (result === "dropped_oldest") {
-      this.metricsService?.wsOutboundDropped.inc();
-    } else if (result === "disconnected") {
-      this.metricsService?.wsSlowConsumerDisconnects.inc();
-      logger.warn(`ws slow consumer disconnected (ip=${state.ip}, queue full)`);
-      this.removeSubscriber(client);
-    }
+  requestRfq(
+    request: Omit<RfqQuoteRequest, "requestId" | "deadline">,
+    eligibleSolvers: string[],
+    windowMs: number,
+  ): Promise<VerifiedRfqQuote[]> {
+    return this.feed.requestRfq(request, eligibleSolvers, windowMs);
   }
 
   /**
@@ -441,9 +340,35 @@ export class IntentsGateway
       case "auth":
         await this.handleAuth(client, msg);
         break;
+      case "rfq_response":
+        this.handleRfqResponse(client, msg);
+        break;
       default:
         break;
     }
+  }
+
+  private handleRfqResponse(client: WebSocket, payload: Record<string, unknown>): void {
+    const solver = this.authenticatedSolver.get(client);
+    if (
+      !solver ||
+      typeof payload.requestId !== "string" ||
+      payload.requestId.length > 64 ||
+      typeof payload.dstAmount !== "string" ||
+      typeof payload.fee !== "string" ||
+      typeof payload.expiresAt !== "number" ||
+      typeof payload.signature !== "string" ||
+      payload.signature.length > 128
+    ) return;
+
+    void this.feed.submitRfqResponse({
+      solver,
+      requestId: payload.requestId,
+      dstAmount: payload.dstAmount,
+      fee: payload.fee,
+      expiresAt: payload.expiresAt,
+      signature: payload.signature,
+    }).catch(() => undefined);
   }
 
   /**
